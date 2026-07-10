@@ -146,17 +146,12 @@ router.get("/", async (req, res) => {
         roomType
       ).toLowerCase();
 
-      return (
-        String(room.roomTypeId) === String(roomType) ||
-        String(room.roomTypeName || "")
-          .toLowerCase()
-          .includes(requestedRoomType) ||
-        String(room.roomTypeCode || "")
-          .toLowerCase()
-          .includes(requestedRoomType)
-      );
-    });
-
+     return (
+  String(room.roomTypeId).toLowerCase() === requestedRoomType ||
+  String(room.roomTypeName || "").toLowerCase() === requestedRoomType ||
+  String(room.roomTypeCode || "").toLowerCase() === requestedRoomType
+);
+});
     const roomsWithAvailability = filteredRooms.map(
       (room) => {
         const reservations = Array.isArray(
