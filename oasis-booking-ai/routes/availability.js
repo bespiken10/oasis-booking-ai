@@ -1,37 +1,55 @@
-const express = require("express");
+import express from "express";
+import * as stayflexiService from "../services/stayflexi.js";
+
 const router = express.Router();
 
-const { getRoomBookings } = require("../services/stayflexi");
+/*
+|--------------------------------------------------------------------------
+| StayFlexi service compatibility
+|--------------------------------------------------------------------------
+|
+| This supports several possible export styles from services/stayflexi.js:
+|
+| export function getRoomBookings() {}
+| export default { getRoomBookings }
+| export default getRoomBookings
+|
+*/
 
-/**
- * Convert any value into a clean lowercase string.
- */
+const getRoomBookings =
+  stayflexiService.getRoomBookings ??
+  stayflexiService.default?.getRoomBookings ??
+  (typeof stayflexiService.default === "function"
+    ? stayflexiService.default
+    : null);
+
+/*
+|--------------------------------------------------------------------------
+| Helper functions
+|--------------------------------------------------------------------------
+*/
+
 function normalize(value) {
   return String(value ?? "")
     .trim()
     .toLowerCase();
 }
 
-/**
- * Check that a date uses YYYY-MM-DD format
- * and represents a real calendar date.
- */
 function isValidDate(value) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ""))) {
+  const dateString = String(value ?? "").trim();
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateString)) {
     return false;
   }
 
-  const date = new Date(`${value}T00:00:00.000Z`);
+  const parsedDate = new Date(`${dateString}T00:00:00.000Z`);
 
   return (
-    !Number.isNaN(date.getTime()) &&
-    date.toISOString().slice(0, 10) === value
+    !Number.isNaN(parsedDate.getTime()) &&
+    parsedDate.toISOString().slice(0, 10) === dateString
   );
 }
 
-/**
- * Extract the room array from possible StayFlexi response formats.
- */
 function extractRooms(response) {
   if (Array.isArray(response)) {
     return response;
@@ -57,12 +75,57 @@ function extractRooms(response) {
     return response.data.roomBookings;
   }
 
+  if (Array.isArray(response?.result)) {
+    return response.result;
+  }
+
+  if (Array.isArray(response?.result?.rooms)) {
+    return response.result.rooms;
+  }
+
   return [];
 }
 
-/**
- * Convert different availability values into true or false.
- */
+function getNumericValue(...values) {
+  for (const value of values) {
+    const number = Number(value);
+
+    if (Number.isFinite(number)) {
+      return number;
+    }
+  }
+
+  return null;
+}
+
+function resolveAvailableCount(room) {
+  const availableCount = getNumericValue(
+    room?.availableRooms,
+    room?.available_rooms,
+    room?.availableRoomCount,
+    room?.available_room_count,
+    room?.availability,
+    room?.available,
+    room?.inventory,
+    room?.remainingInventory,
+    room?.remaining_inventory
+  );
+
+  if (availableCount !== null) {
+    return Math.max(0, availableCount);
+  }
+
+  if (
+    room?.available === true ||
+    room?.isAvailable === true ||
+    room?.is_available === true
+  ) {
+    return 1;
+  }
+
+  return 0;
+}
+
 function resolveAvailability(room) {
   if (typeof room?.available === "boolean") {
     return room.available;
@@ -72,45 +135,57 @@ function resolveAvailability(room) {
     return room.isAvailable;
   }
 
-  if (typeof room?.availability === "boolean") {
-    return room.availability;
+  if (typeof room?.is_available === "boolean") {
+    return room.is_available;
   }
 
-  if (typeof room?.available === "number") {
-    return room.available > 0;
+  const availableCount = resolveAvailableCount(room);
+
+  if (availableCount > 0) {
+    return true;
   }
 
-  if (typeof room?.availability === "number") {
-    return room.availability > 0;
-  }
+  const status = normalize(room?.status);
 
-  if (typeof room?.availableRooms === "number") {
-    return room.availableRooms > 0;
-  }
-
-  if (typeof room?.inventory === "number") {
-    return room.inventory > 0;
-  }
-
-  if (typeof room?.status === "string") {
-    const status = normalize(room.status);
-
-    return (
-      status === "available" ||
-      status === "open" ||
-      status === "vacant" ||
-      status === "true"
-    );
-  }
-
-  return false;
+  return ["available", "open", "vacant", "active"].includes(status);
 }
 
-/**
- * Convert the StayFlexi room object into the format
- * returned by this API.
- */
 function formatRoom(room) {
+  const roomType =
+    room?.roomType ??
+    room?.room_type ??
+    room?.category ??
+    room?.roomCategory ??
+    {};
+
+  const roomTypeId =
+    room?.roomTypeId ??
+    room?.room_type_id ??
+    roomType?.id ??
+    roomType?.roomTypeId ??
+    roomType?.room_type_id ??
+    null;
+
+  const roomTypeName =
+    room?.roomTypeName ??
+    room?.room_type_name ??
+    room?.roomName ??
+    room?.room_name ??
+    roomType?.name ??
+    roomType?.roomTypeName ??
+    roomType?.room_type_name ??
+    room?.name ??
+    null;
+
+  const roomTypeCode =
+    room?.roomTypeCode ??
+    room?.room_type_code ??
+    roomType?.code ??
+    roomType?.roomTypeCode ??
+    roomType?.room_type_code ??
+    room?.code ??
+    null;
+
   return {
     roomId:
       room?.roomId ??
@@ -120,68 +195,129 @@ function formatRoom(room) {
       room?.room_number ??
       null,
 
-    roomTypeId:
-      room?.roomTypeId ??
-      room?.room_type_id ??
-      room?.roomType?.id ??
-      room?.room_type?.id ??
-      null,
-
-    roomTypeName:
-      room?.roomTypeName ??
-      room?.room_type_name ??
-      room?.roomType?.name ??
-      room?.room_type?.name ??
-      room?.name ??
-      null,
-
-    roomTypeCode:
-      room?.roomTypeCode ??
-      room?.room_type_code ??
-      room?.roomType?.code ??
-      room?.room_type?.code ??
-      room?.code ??
-      null,
+    roomTypeId,
+    roomTypeName,
+    roomTypeCode,
 
     available: resolveAvailability(room),
+    availableCount: resolveAvailableCount(room),
+
+    rate: getNumericValue(
+      room?.rate,
+      room?.price,
+      room?.roomRate,
+      room?.room_rate,
+      room?.baseRate,
+      room?.base_rate
+    ),
+
+    currency:
+      room?.currency ??
+      room?.currencyCode ??
+      room?.currency_code ??
+      "INR",
+
+    raw: room,
   };
 }
 
-/**
- * GET /availability
- *
- * Example:
- * /availability?checkin=2026-07-15&checkout=2026-07-16&guests=2
- *
- * Room type may be matched by:
- * - roomTypeId
- * - roomTypeName
- * - roomTypeCode
- *
- * Matching is exact, so "Deluxe" does not match "Super Deluxe".
- */
+function matchesRequestedRoomType(room, requestedRoomType) {
+  if (!requestedRoomType) {
+    return true;
+  }
+
+  return (
+    normalize(room.roomTypeId) === requestedRoomType ||
+    normalize(room.roomTypeName) === requestedRoomType ||
+    normalize(room.roomTypeCode) === requestedRoomType
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Health check
+|--------------------------------------------------------------------------
+*/
+
+router.get("/health", (req, res) => {
+  return res.status(200).json({
+    status: "ok",
+    route: "availability",
+    stayflexiServiceLoaded: typeof getRoomBookings === "function",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Availability route
+|--------------------------------------------------------------------------
+|
+| Examples:
+|
+| /availability?checkin=2026-07-15&checkout=2026-07-16
+|
+| /availability?checkin=2026-07-15&checkout=2026-07-16
+| &guests=2
+| &roomType=Deluxe
+|
+*/
+
 router.get("/", async (req, res) => {
+  const startedAt = Date.now();
+
   try {
-    const hotelId = String(process.env.STAYFLEXI_HOTEL_ID || "").trim();
+    const hotelId = String(
+      process.env.STAYFLEXI_HOTEL_ID ??
+        process.env.HOTEL_ID ??
+        "23268"
+    ).trim();
 
-    const checkin = String(req.query.checkin || "").trim();
-    const checkout = String(req.query.checkout || "").trim();
-    const roomType = String(req.query.roomType || "").trim();
+    const checkin = String(
+      req.query.checkin ??
+        req.query.checkIn ??
+        req.query.check_in ??
+        ""
+    ).trim();
 
-    const guestsValue = Number.parseInt(req.query.guests || "1", 10);
+    const checkout = String(
+      req.query.checkout ??
+        req.query.checkOut ??
+        req.query.check_out ??
+        ""
+    ).trim();
+
+    const roomType = String(
+      req.query.roomType ??
+        req.query.room_type ??
+        req.query.roomTypeName ??
+        ""
+    ).trim();
+
+    const guestsInput = Number.parseInt(
+      String(req.query.guests ?? req.query.adults ?? "1"),
+      10
+    );
+
     const guests =
-      Number.isInteger(guestsValue) && guestsValue > 0 ? guestsValue : 1;
+      Number.isInteger(guestsInput) && guestsInput > 0
+        ? guestsInput
+        : 1;
 
     if (!hotelId) {
       return res.status(500).json({
-        error: "Missing STAYFLEXI_HOTEL_ID",
+        status: "error",
+        error: "Missing hotel configuration",
+        message:
+          "STAYFLEXI_HOTEL_ID is not configured in Railway Variables.",
       });
     }
 
     if (!checkin || !checkout) {
       return res.status(400).json({
+        status: "error",
         error: "Missing required dates",
-        required: ["checkin", "checkout"],
+        message: "Both checkin and checkout are required.",
         example:
           "/availability?checkin=2026-07-15&checkout=2026-07-16&guests=2",
       });
@@ -189,6 +325,7 @@ router.get("/", async (req, res) => {
 
     if (!isValidDate(checkin) || !isValidDate(checkout)) {
       return res.status(400).json({
+        status: "error",
         error: "Invalid date format",
         message: "Dates must use YYYY-MM-DD format.",
       });
@@ -199,51 +336,76 @@ router.get("/", async (req, res) => {
 
     if (checkoutDate <= checkinDate) {
       return res.status(400).json({
+        status: "error",
         error: "Invalid date range",
         message: "Checkout must be later than check-in.",
       });
     }
 
-    /*
-     * This expects services/stayflexi.js to export:
-     *
-     * getRoomBookings(hotelId, checkin, checkout)
-     */
+    if (typeof getRoomBookings !== "function") {
+      console.error(
+        "StayFlexi service export error. Available exports:",
+        Object.keys(stayflexiService)
+      );
+
+      return res.status(500).json({
+        status: "error",
+        error: "StayFlexi service is not configured correctly",
+        message:
+          "services/stayflexi.js must export getRoomBookings.",
+        availableExports: Object.keys(stayflexiService),
+      });
+    }
+
+    console.log("Checking StayFlexi availability", {
+      hotelId,
+      checkin,
+      checkout,
+      guests,
+      roomType: roomType || null,
+    });
+
     const stayflexiResponse = await getRoomBookings(
       hotelId,
       checkin,
-      checkout
+      checkout,
+      guests
     );
 
-    const rooms = extractRooms(stayflexiResponse).map(formatRoom);
+    const extractedRooms = extractRooms(stayflexiResponse);
+    const formattedRooms = extractedRooms.map(formatRoom);
 
     const requestedRoomType = normalize(roomType);
 
-    const filteredRooms = requestedRoomType
-      ? rooms.filter((room) => {
-          return (
-            normalize(room.roomTypeId) === requestedRoomType ||
-            normalize(room.roomTypeName) === requestedRoomType ||
-            normalize(room.roomTypeCode) === requestedRoomType
-          );
-        })
-      : rooms;
+    const filteredRooms = formattedRooms.filter((room) =>
+      matchesRequestedRoomType(room, requestedRoomType)
+    );
 
     const availableRooms = filteredRooms.filter(
       (room) => room.available === true
     );
 
-    const unavailableRooms = filteredRooms.filter(
-      (room) => room.available !== true
+    const totalAvailableInventory = availableRooms.reduce(
+      (total, room) => total + room.availableCount,
+      0
+    );
+
+    const nights = Math.round(
+      (checkoutDate.getTime() - checkinDate.getTime()) /
+        (1000 * 60 * 60 * 24)
     );
 
     return res.status(200).json({
-      status: "live",
+      status: "success",
+      source: "StayFlexi",
+      live: true,
+
       hotelId,
 
       request: {
         checkin,
         checkout,
+        nights,
         guests,
         roomType: roomType || null,
       },
@@ -251,30 +413,59 @@ router.get("/", async (req, res) => {
       available: availableRooms.length > 0,
 
       summary: {
-        totalRoomsChecked: filteredRooms.length,
-        availableRoomCount: availableRooms.length,
-        unavailableRoomCount: unavailableRooms.length,
+        roomsReceivedFromStayFlexi: extractedRooms.length,
+        roomsMatchingRequest: filteredRooms.length,
+        availableRoomTypes: availableRooms.length,
+        totalAvailableInventory,
       },
 
-      rooms: filteredRooms,
+      rooms: filteredRooms.map(({ raw, ...room }) => room),
+
+      responseTimeMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Availability route error:", {
+    const upstreamStatus =
+      error?.response?.status ??
+      error?.status ??
+      502;
+
+    const upstreamData =
+      error?.response?.data ??
+      error?.data ??
+      null;
+
+    console.error("Availability route failed", {
       message: error?.message,
-      status: error?.response?.status,
-      data: error?.response?.data,
+      status: upstreamStatus,
+      upstreamData,
       stack: error?.stack,
     });
 
-    return res.status(error?.response?.status || 502).json({
+    return res.status(
+      upstreamStatus >= 400 && upstreamStatus < 600
+        ? upstreamStatus
+        : 502
+    ).json({
       status: "error",
       error: "Unable to retrieve live availability",
       message:
-        error?.response?.data?.message ||
-        error?.message ||
+        upstreamData?.message ??
+        upstreamData?.error ??
+        error?.message ??
         "StayFlexi request failed.",
+
+      upstreamStatus,
+      responseTimeMs: Date.now() - startedAt,
+      checkedAt: new Date().toISOString(),
     });
   }
 });
 
-module.exports = router;
+/*
+|--------------------------------------------------------------------------
+| Default ES-module export
+|--------------------------------------------------------------------------
+*/
+
+export default router;
