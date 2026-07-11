@@ -1,60 +1,42 @@
-import "dotenv/config";
+const BASE_URL =
+  process.env.STAYFLEXI_BASE_URL?.trim() ||
+  "https://api.stayflexi.com";
 
-const DEFAULT_BASE_URL = "https://api.stayflexi.com";
-const DEFAULT_TIMEOUT_MS = 15000;
+const HOTEL_ID = process.env.STAYFLEXI_HOTEL_ID?.trim();
+const TOKEN = process.env.STAYFLEXI_TOKEN?.trim();
 
-function getConfig() {
+/**
+ * Returns safe configuration information.
+ * It never returns the actual token.
+ */
+export function getStayflexiConfigStatus() {
   return {
-    baseUrl: String(
-      process.env.STAYFLEXI_BASE_URL || DEFAULT_BASE_URL
-    ).replace(/\/+$/, ""),
-
-    hotelId: String(process.env.STAYFLEXI_HOTEL_ID || "").trim(),
-
-    token: String(process.env.STAYFLEXI_TOKEN || "").trim(),
-
-    availabilityPath: String(
-      process.env.STAYFLEXI_AVAILABILITY_PATH ||
-        "/room/getRoomBookings"
-    ).trim(),
-
-    timeoutMs:
-      Number.parseInt(process.env.STAYFLEXI_TIMEOUT_MS || "", 10) ||
-      DEFAULT_TIMEOUT_MS,
+    baseUrl: BASE_URL,
+    hotelIdConfigured: Boolean(HOTEL_ID),
+    tokenConfigured: Boolean(TOKEN),
   };
 }
 
-function requireConfig() {
-  const config = getConfig();
-
-  if (!config.hotelId) {
+/**
+ * Validate required environment variables.
+ */
+function requireStayflexiConfig() {
+  if (!HOTEL_ID) {
     const error = new Error("Missing STAYFLEXI_HOTEL_ID");
     error.statusCode = 500;
     throw error;
   }
 
-  if (!config.token) {
+  if (!TOKEN) {
     const error = new Error("Missing STAYFLEXI_TOKEN");
     error.statusCode = 500;
     throw error;
   }
-
-  return config;
 }
 
-function buildUrl(baseUrl, path, query = {}) {
-  const cleanPath = path.startsWith("/") ? path : `/${path}`;
-  const url = new URL(`${baseUrl}${cleanPath}`);
-
-  for (const [key, value] of Object.entries(query)) {
-    if (value !== undefined && value !== null && value !== "") {
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  return url;
-}
-
+/**
+ * Parse an upstream response safely.
+ */
 async function parseResponse(response) {
   const responseText = await response.text();
 
@@ -66,36 +48,114 @@ async function parseResponse(response) {
     return JSON.parse(responseText);
   } catch {
     return {
-      raw: responseText,
+      rawResponse: responseText.slice(0, 1000),
     };
   }
 }
 
-function getUpstreamMessage(data, status) {
-  if (!data) {
-    return `StayFlexi returned HTTP ${status} with an empty response`;
+/**
+ * Base request helper for StayFlexi.
+ *
+ * Do not log TOKEN or request headers containing TOKEN.
+ */
+export async function stayflexiRequest(
+  path,
+  {
+    method = "GET",
+    query = {},
+    body,
+    headers = {},
+    timeoutMs = 15000,
+  } = {}
+) {
+  requireStayflexiConfig();
+
+  if (!path || typeof path !== "string") {
+    throw new Error("A valid StayFlexi API path is required");
   }
 
-  if (typeof data === "string") {
-    return data;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${BASE_URL}${normalizedPath}`);
+
+  for (const [key, value] of Object.entries(query)) {
+    if (
+      value !== undefined &&
+      value !== null &&
+      String(value).trim() !== ""
+    ) {
+      url.searchParams.set(key, String(value));
+    }
   }
 
-  return (
-    data.message ||
-    data.error ||
-    data.errorMessage ||
-    data.detail ||
-    `StayFlexi returned HTTP ${status}`
-  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      method,
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+
+        /*
+         * This authorization format may need adjustment after we inspect
+         * the exact successful StayFlexi browser request.
+         */
+        Authorization: `Bearer ${TOKEN}`,
+
+        ...headers,
+      },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+
+    const data = await parseResponse(response);
+
+    if (!response.ok) {
+      const error = new Error(
+        `StayFlexi request failed with HTTP ${response.status}`
+      );
+
+      error.statusCode = 502;
+      error.upstreamStatus = response.status;
+      error.upstreamData = data;
+      error.requestUrl = url.toString();
+
+      throw error;
+    }
+
+    return {
+      status: response.status,
+      data,
+      requestUrl: url.toString(),
+    };
+  } catch (error) {
+    if (error.name === "AbortError") {
+      const timeoutError = new Error(
+        `StayFlexi request timed out after ${timeoutMs}ms`
+      );
+
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
+/**
+ * Temporary diagnostic function.
+ *
+ * We will replace the endpoint path and query structure after confirming
+ * the exact StayFlexi availability request.
+ */
 export async function getRoomBookings({
   checkin,
   checkout,
   guests = 1,
 } = {}) {
-  const config = requireConfig();
-
   if (!checkin) {
     const error = new Error(
       "Missing StayFlexi start date. Provide checkin or startDate."
@@ -112,202 +172,53 @@ export async function getRoomBookings({
     throw error;
   }
 
-  const url = buildUrl(config.baseUrl, config.availabilityPath, {
-    hotel_id: config.hotelId,
-    hotelId: config.hotelId,
-    checkin,
-    checkout,
-    startDate: checkin,
-    endDate: checkout,
-    guests,
-  });
+  /*
+   * Keep the endpoint configurable until its exact path is confirmed.
+   */
+  const availabilityPath =
+    process.env.STAYFLEXI_AVAILABILITY_PATH?.trim();
 
-  const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, config.timeoutMs);
-
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Accept: "application/json",
-        Authorization: `Bearer ${config.token}`,
-        token: config.token,
-        "x-access-token": config.token,
-        hotel_id: config.hotelId,
-        hotelId: config.hotelId,
-      },
-      signal: controller.signal,
-    });
-
-    const data = await parseResponse(response);
-
-    if (!response.ok) {
-      const error = new Error(
-        getUpstreamMessage(data, response.status)
-      );
-
-      error.statusCode = 502;
-      error.upstreamStatus = response.status;
-      error.upstreamData = data;
-
-      throw error;
-    }
-
-    return data;
-  } catch (error) {
-    if (error.name === "AbortError") {
-      const timeoutError = new Error(
-        `StayFlexi request timed out after ${config.timeoutMs}ms`
-      );
-
-      timeoutError.statusCode = 504;
-      timeoutError.upstreamStatus = 504;
-
-      throw timeoutError;
-    }
-
-    if (error.statusCode) {
-      throw error;
-    }
-
-    const networkError = new Error(
-      `StayFlexi network request failed: ${error.message}`
+  if (!availabilityPath) {
+    const error = new Error(
+      "Missing STAYFLEXI_AVAILABILITY_PATH. Configure the verified StayFlexi availability endpoint before making live requests."
     );
 
-    networkError.statusCode = 502;
-    throw networkError;
-  } finally {
-    clearTimeout(timeout);
+    error.statusCode = 500;
+    throw error;
   }
+
+  return stayflexiRequest(availabilityPath, {
+    query: {
+      hotel_id: HOTEL_ID,
+      hotelId: HOTEL_ID,
+      checkin,
+      checkout,
+      guests,
+    },
+  });
 }
 
-function firstArray(...values) {
-  for (const value of values) {
-    if (Array.isArray(value)) {
-      return value;
-    }
+/**
+ * Export retained because server.js previously attempted to import it.
+ * This prevents the old “does not provide an export named getRoomTypes”
+ * crash.
+ */
+export async function getRoomTypes() {
+  const roomTypesPath = process.env.STAYFLEXI_ROOM_TYPES_PATH?.trim();
+
+  if (!roomTypesPath) {
+    const error = new Error(
+      "Missing STAYFLEXI_ROOM_TYPES_PATH"
+    );
+
+    error.statusCode = 500;
+    throw error;
   }
 
-  return [];
-}
-
-function toBooleanAvailability(room) {
-  if (typeof room.available === "boolean") {
-    return room.available;
-  }
-
-  if (typeof room.isAvailable === "boolean") {
-    return room.isAvailable;
-  }
-
-  const availableCount = Number(
-    room.availableRooms ??
-      room.availableRoomCount ??
-      room.inventory ??
-      room.roomsAvailable ??
-      room.count ??
-      room.quantity
-  );
-
-  if (Number.isFinite(availableCount)) {
-    return availableCount > 0;
-  }
-
-  const status = String(
-    room.status || room.availabilityStatus || ""
-  )
-    .trim()
-    .toLowerCase();
-
-  if (
-    ["available", "open", "vacant", "true", "yes"].includes(status)
-  ) {
-    return true;
-  }
-
-  if (
-    ["unavailable", "closed", "occupied", "false", "no"].includes(status)
-  ) {
-    return false;
-  }
-
-  return false;
-}
-
-export function normalizeStayflexiRooms(payload) {
-  const rooms = firstArray(
-    payload,
-    payload?.rooms,
-    payload?.data,
-    payload?.data?.rooms,
-    payload?.data?.roomBookings,
-    payload?.roomBookings,
-    payload?.result,
-    payload?.result?.rooms,
-    payload?.response,
-    payload?.response?.rooms
-  );
-
-  return rooms.map((room, index) => {
-    return {
-      roomId: String(
-        room.roomId ??
-          room.room_id ??
-          room.id ??
-          room.inventoryId ??
-          index + 1
-      ),
-
-      roomTypeId: String(
-        room.roomTypeId ??
-          room.room_type_id ??
-          room.roomTypeID ??
-          room.categoryId ??
-          ""
-      ),
-
-      roomTypeName: String(
-        room.roomTypeName ??
-          room.room_type_name ??
-          room.categoryName ??
-          room.name ??
-          ""
-      ),
-
-      roomTypeCode: String(
-        room.roomTypeCode ??
-          room.room_type_code ??
-          room.code ??
-          ""
-      ),
-
-      available: toBooleanAvailability(room),
-
-      availableRooms:
-        Number(
-          room.availableRooms ??
-            room.availableRoomCount ??
-            room.inventory ??
-            room.roomsAvailable
-        ) || undefined,
-
-      rate:
-        Number(
-          room.rate ??
-            room.price ??
-            room.roomRate ??
-            room.baseRate
-        ) || undefined,
-
-      currency: String(
-        room.currency ??
-          room.currencyCode ??
-          room.currency_code ??
-          ""
-      ) || undefined,
-    };
+  return stayflexiRequest(roomTypesPath, {
+    query: {
+      hotel_id: HOTEL_ID,
+      hotelId: HOTEL_ID,
+    },
   });
 }
