@@ -1,171 +1,189 @@
 import express from "express";
+
 import {
   getRoomBookings,
-  normalizeStayflexiRooms,
+  getStayflexiConfigStatus,
 } from "../services/stayflexi.js";
 
 const router = express.Router();
 
-function normalizeText(value) {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase();
-}
-
-function isValidDate(value) {
-  if (!value) {
-    return false;
+/**
+ * Validate a date in YYYY-MM-DD format.
+ */
+function normalizeDate(value) {
+  if (value === undefined || value === null) {
+    return null;
   }
 
-  const date = new Date(`${value}T00:00:00Z`);
+  const normalized = String(value).trim();
 
-  return !Number.isNaN(date.getTime());
-}
-
-function findMatchingRooms(rooms, requestedRoomType) {
-  if (!requestedRoomType) {
-    return rooms;
+  if (!normalized) {
+    return null;
   }
 
-  const wanted = normalizeText(requestedRoomType);
+  const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 
-  return rooms.filter((room) => {
-    const roomTypeId = normalizeText(room.roomTypeId);
-    const roomTypeName = normalizeText(room.roomTypeName);
-    const roomTypeCode = normalizeText(room.roomTypeCode);
+  if (!datePattern.test(normalized)) {
+    return null;
+  }
 
-    return (
-      roomTypeId === wanted ||
-      roomTypeName === wanted ||
-      roomTypeCode === wanted
-    );
-  });
+  const parsedDate = new Date(`${normalized}T00:00:00.000Z`);
+
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null;
+  }
+
+  return normalized;
 }
 
-// Route status check
-router.get("/status", (req, res) => {
-  res.status(200).json({
+/**
+ * Validate guest count.
+ */
+function normalizeGuests(value) {
+  const guests = Number.parseInt(value, 10);
+
+  if (!Number.isInteger(guests)) {
+    return null;
+  }
+
+  if (guests < 1 || guests > 20) {
+    return null;
+  }
+
+  return guests;
+}
+
+/**
+ * Safe error payload for upstream failures.
+ */
+function buildErrorResponse(error, requestStartedAt) {
+  return {
+    status: "error",
+    error: "Unable to retrieve live availability",
+    message: error?.message || "Unknown availability error",
+    upstreamStatus: error?.upstreamStatus || null,
+    upstreamData: error?.upstreamData || null,
+    responseTimeMs: Date.now() - requestStartedAt,
+    checkedAt: new Date().toISOString(),
+  };
+}
+
+/**
+ * Availability route health check.
+ *
+ * GET /availability/health
+ */
+router.get("/health", (req, res) => {
+  const config = getStayflexiConfigStatus();
+
+  return res.status(200).json({
     status: "ok",
     route: "availability",
     stayflexiServiceLoaded: true,
+    configuration: config,
     timestamp: new Date().toISOString(),
   });
 });
 
-// Live availability
+/**
+ * Live availability endpoint.
+ *
+ * Example:
+ * GET /availability?checkin=2026-07-15&checkout=2026-07-16&guests=2
+ */
 router.get("/", async (req, res) => {
-  const startedAt = Date.now();
+  const requestStartedAt = Date.now();
 
-  const checkin = String(
-    req.query.checkin || req.query.startDate || ""
-  ).trim();
-
-  const checkout = String(
-    req.query.checkout || req.query.endDate || ""
-  ).trim();
-
-  const guests = Math.max(
-    1,
-    Number.parseInt(req.query.guests || req.query.adults || "1", 10) || 1
+  const checkin = normalizeDate(
+    req.query.checkin || req.query.startDate
   );
 
-  const roomType = String(req.query.roomType || "").trim() || null;
+  const checkout = normalizeDate(
+    req.query.checkout || req.query.endDate
+  );
+
+  const guests = normalizeGuests(req.query.guests || 1);
 
   if (!checkin) {
     return res.status(400).json({
       status: "error",
-      error: "Missing check-in date",
+      error: "Invalid check-in date",
       message: "Provide checkin in YYYY-MM-DD format.",
       example:
         "/availability?checkin=2026-07-15&checkout=2026-07-16&guests=2",
-      responseTimeMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
     });
   }
 
   if (!checkout) {
     return res.status(400).json({
       status: "error",
-      error: "Missing check-out date",
+      error: "Invalid checkout date",
       message: "Provide checkout in YYYY-MM-DD format.",
-      responseTimeMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
+      example:
+        "/availability?checkin=2026-07-15&checkout=2026-07-16&guests=2",
     });
   }
 
-  if (!isValidDate(checkin) || !isValidDate(checkout)) {
-    return res.status(400).json({
-      status: "error",
-      error: "Invalid date",
-      message: "Both dates must use YYYY-MM-DD format.",
-      responseTimeMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
-    });
-  }
-
-  if (new Date(`${checkout}T00:00:00Z`) <= new Date(`${checkin}T00:00:00Z`)) {
+  if (checkout <= checkin) {
     return res.status(400).json({
       status: "error",
       error: "Invalid date range",
-      message: "checkout must be later than checkin.",
-      responseTimeMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
+      message: "Checkout must be later than check-in.",
+    });
+  }
+
+  if (!guests) {
+    return res.status(400).json({
+      status: "error",
+      error: "Invalid guest count",
+      message: "Guests must be a whole number between 1 and 20.",
     });
   }
 
   try {
-    const upstreamData = await getRoomBookings({
+    console.log("[availability] Request received", {
       checkin,
       checkout,
       guests,
     });
 
-    const rooms = normalizeStayflexiRooms(upstreamData);
-
-    const filteredRooms = findMatchingRooms(rooms, roomType);
-
-    const availableRooms = filteredRooms.filter(
-      (room) => room.available === true
-    );
-
-    const unavailableRooms = filteredRooms.filter(
-      (room) => room.available !== true
-    );
+    const upstreamResult = await getRoomBookings({
+      checkin,
+      checkout,
+      guests,
+    });
 
     return res.status(200).json({
       status: "live",
-      hotelId: process.env.STAYFLEXI_HOTEL_ID,
       request: {
         checkin,
         checkout,
         guests,
-        roomType,
       },
-      available: availableRooms.length > 0,
-      summary: {
-        totalRoomsChecked: filteredRooms.length,
-        availableRoomCount: availableRooms.length,
-        unavailableRoomCount: unavailableRooms.length,
-      },
-      rooms: filteredRooms,
-      responseTimeMs: Date.now() - startedAt,
+      upstreamStatus: upstreamResult.status,
+      data: upstreamResult.data,
+      responseTimeMs: Date.now() - requestStartedAt,
       checkedAt: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Availability route failed:", {
-      message: error.message,
-      statusCode: error.statusCode,
-      upstreamStatus: error.upstreamStatus,
+    console.error("[availability] Request failed", {
+      message: error?.message,
+      statusCode: error?.statusCode,
+      upstreamStatus: error?.upstreamStatus,
+      upstreamData: error?.upstreamData,
+      responseTimeMs: Date.now() - requestStartedAt,
     });
 
-    return res.status(error.statusCode || 502).json({
-      status: "error",
-      error: "Unable to retrieve live availability",
-      message: error.message,
-      upstreamStatus: error.upstreamStatus || null,
-      responseTimeMs: Date.now() - startedAt,
-      checkedAt: new Date().toISOString(),
-    });
+    const statusCode =
+      Number.isInteger(error?.statusCode) &&
+      error.statusCode >= 400 &&
+      error.statusCode <= 599
+        ? error.statusCode
+        : 500;
+
+    return res
+      .status(statusCode)
+      .json(buildErrorResponse(error, requestStartedAt));
   }
 });
 
